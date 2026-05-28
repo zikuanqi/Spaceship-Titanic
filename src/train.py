@@ -36,6 +36,10 @@ PARAMS.mkdir(exist_ok=True)
 N_SPLITS = 5
 LGB_SEEDS = [42, 1337, 2024]
 
+# Pseudo-labeling: pick test rows where the first-pass blend is very confident.
+PSEUDO_HIGH = 0.92
+PSEUDO_LOW = 0.08
+
 
 def load_lgb_params() -> dict:
     path = PARAMS / "lgb_params.json"
@@ -158,6 +162,97 @@ def train_cat_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int = 42)
     return model.predict_proba(x_va_s)[:, 1], model.predict_proba(x_test_s)[:, 1]
 
 
+def run_ensemble(
+    train_feats: pd.DataFrame,
+    target: pd.Series,
+    test_feats: pd.DataFrame,
+    lgb_params: dict,
+    xgb_params: dict,
+    cat_params: dict,
+    extra_X: pd.DataFrame | None = None,
+    extra_y: pd.Series | None = None,
+    label: str = "",
+) -> tuple[dict, dict, list]:
+    """Run 5-fold ensemble over the original train rows.
+
+    If `extra_X` / `extra_y` is given, they're appended to every fold's training
+    set (used for pseudo-labeling). The held-out folds and test predictions
+    remain on the original splits.
+    """
+    n_train = len(train_feats); n_test = len(test_feats)
+    oof_lgb = np.zeros(n_train); test_lgb = np.zeros(n_test)
+    oof_xgb = np.zeros(n_train); test_xgb = np.zeros(n_test)
+    oof_cat = np.zeros(n_train); test_cat = np.zeros(n_test)
+    oof_hgb = np.zeros(n_train); test_hgb = np.zeros(n_test)
+    oof_lr  = np.zeros(n_train); test_lr  = np.zeros(n_test)
+
+    folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+    for fold, (tr_idx, va_idx) in enumerate(folds.split(train_feats, target), 1):
+        x_tr = train_feats.iloc[tr_idx]; x_va = train_feats.iloc[va_idx]
+        y_tr = target.iloc[tr_idx]; y_va = target.iloc[va_idx]
+
+        if extra_X is not None and len(extra_X) > 0:
+            x_tr = pd.concat([x_tr, extra_X], axis=0, ignore_index=True)
+            y_tr = pd.concat([y_tr, extra_y], axis=0, ignore_index=True)
+
+        x_tr_te, x_va_te, x_test_te = apply_target_encoding(x_tr, y_tr, x_va, test_feats)
+
+        # LightGBM × multiple seeds (averaged)
+        lgb_va = np.zeros(len(x_va)); lgb_te = np.zeros(n_test)
+        for sd in LGB_SEEDS:
+            va_p, te_p = train_lgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, lgb_params, sd)
+            lgb_va += va_p / len(LGB_SEEDS)
+            lgb_te += te_p / len(LGB_SEEDS)
+        oof_lgb[va_idx] = lgb_va; test_lgb += lgb_te / N_SPLITS
+
+        xgb_va, xgb_te = train_xgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, xgb_params)
+        oof_xgb[va_idx] = xgb_va; test_xgb += xgb_te / N_SPLITS
+
+        cat_va, cat_te = train_cat_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, cat_params)
+        oof_cat[va_idx] = cat_va; test_cat += cat_te / N_SPLITS
+
+        hgb_va, hgb_te = train_hgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
+        oof_hgb[va_idx] = hgb_va; test_hgb += hgb_te / N_SPLITS
+
+        lr_va, lr_te = train_lr_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
+        oof_lr[va_idx] = lr_va; test_lr += lr_te / N_SPLITS
+
+        print(
+            f"[{label}] fold {fold}: "
+            f"LGB={accuracy_score(y_va, lgb_va>=0.5):.4f}  "
+            f"XGB={accuracy_score(y_va, xgb_va>=0.5):.4f}  "
+            f"CAT={accuracy_score(y_va, cat_va>=0.5):.4f}  "
+            f"HGB={accuracy_score(y_va, hgb_va>=0.5):.4f}  "
+            f"LR={accuracy_score(y_va, lr_va>=0.5):.4f}"
+        )
+
+    oofs = {"lgb": oof_lgb, "xgb": oof_xgb, "cat": oof_cat, "hgb": oof_hgb, "lr": oof_lr}
+    tests = {"lgb": test_lgb, "xgb": test_xgb, "cat": test_cat, "hgb": test_hgb, "lr": test_lr}
+    return oofs, tests, list(oofs.keys())
+
+
+def fit_logloss_weights(oof_M: np.ndarray, y_arr: np.ndarray) -> np.ndarray:
+    from scipy.optimize import minimize
+    def neg_ll(w):
+        w = np.clip(w, 1e-9, None); w = w / w.sum()
+        p = np.clip(oof_M @ w, 1e-7, 1 - 1e-7)
+        return -(y_arr * np.log(p) + (1 - y_arr) * np.log(1 - p)).mean()
+    res = minimize(neg_ll, np.ones(oof_M.shape[1]) / oof_M.shape[1],
+                   method="Nelder-Mead",
+                   options={"xatol": 1e-6, "fatol": 1e-7, "maxiter": 8000})
+    w = np.clip(res.x, 0, None); return w / w.sum()
+
+
+def honest_blend_cv(oof_M: np.ndarray, y_arr: np.ndarray) -> np.ndarray:
+    """Leave-one-fold-out blend weight fit -> honest CV blend probabilities."""
+    out = np.zeros(len(y_arr))
+    folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+    for tr_idx, va_idx in folds.split(np.zeros(len(y_arr)), y_arr):
+        w = fit_logloss_weights(oof_M[tr_idx], y_arr[tr_idx])
+        out[va_idx] = oof_M[va_idx] @ w
+    return out
+
+
 def main() -> None:
     train_raw = pd.read_csv(DATA / "train.csv")
     test_raw = pd.read_csv(DATA / "test.csv")
@@ -177,149 +272,100 @@ def main() -> None:
     print(f"XGB params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in xgb_params.items()}, indent=None)}")
     print(f"CAT params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in cat_params.items()}, indent=None)}")
 
-    oof_lgb = np.zeros(len(train_feats))
-    oof_xgb = np.zeros(len(train_feats))
-    oof_cat = np.zeros(len(train_feats))
-    oof_hgb = np.zeros(len(train_feats))
-    oof_lr  = np.zeros(len(train_feats))
-    test_lgb = np.zeros(len(test_feats))
-    test_xgb = np.zeros(len(test_feats))
-    test_cat = np.zeros(len(test_feats))
-    test_hgb = np.zeros(len(test_feats))
-    test_lr  = np.zeros(len(test_feats))
-
-    folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    for fold, (tr_idx, va_idx) in enumerate(folds.split(train_feats, target), 1):
-        x_tr = train_feats.iloc[tr_idx]; x_va = train_feats.iloc[va_idx]
-        y_tr = target.iloc[tr_idx]; y_va = target.iloc[va_idx]
-
-        x_tr_te, x_va_te, x_test_te = apply_target_encoding(x_tr, y_tr, x_va, test_feats)
-
-        # LightGBM × multiple seeds (averaged)
-        lgb_va = np.zeros(len(x_va)); lgb_te = np.zeros(len(test_feats))
-        for sd in LGB_SEEDS:
-            va_p, te_p = train_lgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, lgb_params, sd)
-            lgb_va += va_p / len(LGB_SEEDS)
-            lgb_te += te_p / len(LGB_SEEDS)
-        oof_lgb[va_idx] = lgb_va
-        test_lgb += lgb_te / N_SPLITS
-
-        # XGBoost
-        xgb_va, xgb_te = train_xgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, xgb_params)
-        oof_xgb[va_idx] = xgb_va
-        test_xgb += xgb_te / N_SPLITS
-
-        # CatBoost
-        cat_va, cat_te = train_cat_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, cat_params)
-        oof_cat[va_idx] = cat_va
-        test_cat += cat_te / N_SPLITS
-
-        # HistGradientBoosting
-        hgb_va, hgb_te = train_hgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
-        oof_hgb[va_idx] = hgb_va
-        test_hgb += hgb_te / N_SPLITS
-
-        # Logistic Regression
-        lr_va, lr_te = train_lr_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
-        oof_lr[va_idx] = lr_va
-        test_lr += lr_te / N_SPLITS
-
-        print(
-            f"fold {fold}: "
-            f"LGB={accuracy_score(y_va, lgb_va>=0.5):.4f}  "
-            f"XGB={accuracy_score(y_va, xgb_va>=0.5):.4f}  "
-            f"CAT={accuracy_score(y_va, cat_va>=0.5):.4f}  "
-            f"HGB={accuracy_score(y_va, hgb_va>=0.5):.4f}  "
-            f"LR={accuracy_score(y_va, lr_va>=0.5):.4f}"
-        )
-
-    oofs = {"lgb": oof_lgb, "xgb": oof_xgb, "cat": oof_cat, "hgb": oof_hgb, "lr": oof_lr}
-    tests = {"lgb": test_lgb, "xgb": test_xgb, "cat": test_cat, "hgb": test_hgb, "lr": test_lr}
-    names = list(oofs.keys())
+    oofs, tests, names = run_ensemble(
+        train_feats, target, test_feats,
+        lgb_params, xgb_params, cat_params,
+        label="pass 1",
+    )
 
     print("\n=== overall CV accuracy ===")
     for n in names:
         print(f"{n.upper():5}: {accuracy_score(target, oofs[n]>=0.5):.4f}  (logloss {log_loss(target, oofs[n]):.4f})")
 
-    oof_matrix = np.stack([oofs[n] for n in names], axis=1)
-    test_matrix = np.stack([tests[n] for n in names], axis=1)
     y = target.to_numpy()
 
-    blend_eq = oof_matrix.mean(axis=1)
-    print(f"BLEND eq      : acc {accuracy_score(target, blend_eq>=0.5):.4f}  (logloss {log_loss(target, blend_eq):.4f})")
+    def report(oofs_d, tests_d, label):
+        """Compute blend, stacking, honest CV; return picked (test_pred, oof_pred, honest_acc, method)."""
+        M = np.stack([oofs_d[n] for n in names], axis=1)
+        T = np.stack([tests_d[n] for n in names], axis=1)
 
-    # ---- logloss-optimal weights on the simplex (smooth, much less prone --
-    # ---- to OOF overfit than tuning weights+threshold against accuracy). -
-    from scipy.optimize import minimize
+        print(f"\n=== {label}: per-model OOF ===")
+        for n in names:
+            print(f"  {n.upper():5}: acc {accuracy_score(y, oofs_d[n]>=0.5):.4f}  "
+                  f"(logloss {log_loss(y, oofs_d[n]):.4f})")
 
-    def fit_logloss_weights(oof_M: np.ndarray, y_arr: np.ndarray) -> np.ndarray:
-        def neg_ll(w):
-            w = np.clip(w, 1e-9, None); w = w / w.sum()
-            p = np.clip(oof_M @ w, 1e-7, 1 - 1e-7)
-            return -(y_arr * np.log(p) + (1 - y_arr) * np.log(1 - p)).mean()
-        res = minimize(neg_ll, np.ones(oof_M.shape[1]) / oof_M.shape[1],
-                       method="Nelder-Mead",
-                       options={"xatol": 1e-6, "fatol": 1e-7, "maxiter": 8000})
-        w = np.clip(res.x, 0, None); return w / w.sum()
+        w_opt = fit_logloss_weights(M, y)
+        blend_w = M @ w_opt
+        test_blend = T @ w_opt
+        print(f"  BLEND weights : {dict(zip(names, np.round(w_opt, 3)))}")
+        print(f"  BLEND ll-opt  : acc {accuracy_score(y, blend_w>=0.5):.4f}  "
+              f"(logloss {log_loss(y, blend_w):.4f})")
 
-    w_opt = fit_logloss_weights(oof_matrix, y)
-    blend_w = oof_matrix @ w_opt
-    test_blend = test_matrix @ w_opt
-    print(f"BLEND weights : {dict(zip(names, np.round(w_opt, 3)))}")
-    print(f"BLEND ll-opt  : acc {accuracy_score(y, blend_w>=0.5):.4f}  (logloss {log_loss(y, blend_w):.4f})")
+        def to_logit(p):
+            p = np.clip(p, 1e-6, 1 - 1e-6); return np.log(p / (1 - p))
+        Z = to_logit(M); Z_test = to_logit(T)
+        meta = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs", random_state=42)
+        meta.fit(Z, y)
+        stack_oof = meta.predict_proba(Z)[:, 1]
+        stack_test = meta.predict_proba(Z_test)[:, 1]
 
-    # ---- Stacking: L2 logistic regression on OOF predictions -------------
-    # Inputs are logit(p) per base model -- gives the meta-learner linear
-    # access to log-odds, often better than raw probabilities.
-    def to_logit(p):
-        p = np.clip(p, 1e-6, 1 - 1e-6); return np.log(p / (1 - p))
-    Z = to_logit(oof_matrix); Z_test = to_logit(test_matrix)
+        # honest CV: leave-one-fold-out re-fit of weights AND stacking
+        honest_blend = honest_blend_cv(M, y)
+        honest_stack = np.zeros(len(y))
+        for tr_idx, va_idx in StratifiedKFold(N_SPLITS, shuffle=True, random_state=42).split(np.zeros(len(y)), y):
+            mf = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs", random_state=42)
+            mf.fit(Z[tr_idx], y[tr_idx])
+            honest_stack[va_idx] = mf.predict_proba(Z[va_idx])[:, 1]
 
-    meta = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs", random_state=42)
-    meta.fit(Z, y)
-    stack_oof_proba = meta.predict_proba(Z)[:, 1]
-    stack_test_proba = meta.predict_proba(Z_test)[:, 1]
-    print(f"STACK in-fit  : acc {accuracy_score(y, stack_oof_proba>=0.5):.4f}  "
-          f"(logloss {log_loss(y, stack_oof_proba):.4f})")
-    print(f"  meta coefs  : {dict(zip(names, np.round(meta.coef_[0], 3)))}  intercept={meta.intercept_[0]:.3f}")
+        bh = accuracy_score(y, honest_blend >= 0.5)
+        sh = accuracy_score(y, honest_stack >= 0.5)
+        print(f"  BLEND honest  : acc {bh:.4f}  (logloss {log_loss(y, honest_blend):.4f})")
+        print(f"  STACK honest  : acc {sh:.4f}  (logloss {log_loss(y, honest_stack):.4f})")
 
-    # ---- "honest" CV: leave-one-fold-out for BOTH the weight fit and -----
-    # the stacking fit. Unbiased estimate of LB performance.
-    honest_blend = np.zeros(len(y))
-    honest_stack = np.zeros(len(y))
-    honest_folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    for tr_idx, va_idx in honest_folds.split(np.zeros(len(y)), y):
-        w_fold = fit_logloss_weights(oof_matrix[tr_idx], y[tr_idx])
-        honest_blend[va_idx] = oof_matrix[va_idx] @ w_fold
+        if sh > bh:
+            return test_blend if False else stack_test, stack_oof, sh, honest_stack, "stack"
+        return test_blend, blend_w, bh, honest_blend, "blend"
 
-        meta_f = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs", random_state=42)
-        meta_f.fit(Z[tr_idx], y[tr_idx])
-        honest_stack[va_idx] = meta_f.predict_proba(Z[va_idx])[:, 1]
+    test1, oof1, honest1, honest1_arr, method1 = report(oofs, tests, "PASS 1 (no pseudo)")
 
-    blend_honest_acc = accuracy_score(y, honest_blend >= 0.5)
-    stack_honest_acc = accuracy_score(y, honest_stack >= 0.5)
-    print(f"BLEND honest  : acc {blend_honest_acc:.4f}  (logloss {log_loss(y, honest_blend):.4f})")
-    print(f"STACK honest  : acc {stack_honest_acc:.4f}  (logloss {log_loss(y, honest_stack):.4f})")
-    print("  ^ leak-free estimates of LB.")
+    # ============== Pseudo-labeling round ==============
+    mask_pseudo = (test1 >= PSEUDO_HIGH) | (test1 <= PSEUDO_LOW)
+    n_pseudo = int(mask_pseudo.sum())
+    print(f"\n=== Pseudo-labeling ===")
+    print(f"  threshold [<{PSEUDO_LOW}, >{PSEUDO_HIGH}] → {n_pseudo}/{len(test_feats)} "
+          f"test rows selected ({100*n_pseudo/len(test_feats):.1f}%)")
 
-    # ---- pick whichever has the better honest CV -------------------------
-    if stack_honest_acc > blend_honest_acc:
-        print("→ using STACK as final submission")
-        final = stack_test_proba; final_oof = stack_oof_proba; method = "stack"
+    pseudo_X = test_feats.iloc[mask_pseudo].reset_index(drop=True)
+    pseudo_y = pd.Series((test1[mask_pseudo] >= 0.5).astype(int)).reset_index(drop=True)
+    print(f"  pseudo label balance: {pseudo_y.mean():.3f} positive")
+
+    oofs2, tests2, _ = run_ensemble(
+        train_feats, target, test_feats,
+        lgb_params, xgb_params, cat_params,
+        extra_X=pseudo_X, extra_y=pseudo_y, label="pass 2",
+    )
+    test2, oof2, honest2, honest2_arr, method2 = report(oofs2, tests2, "PASS 2 (with pseudo)")
+
+    # ============== Pick the better pass ==============
+    if honest2 > honest1:
+        print(f"\n→ Pseudo helped ({honest1:.4f} → {honest2:.4f}); using PASS 2.")
+        final_test, final_oof, used_method, used_pass = test2, oof2, method2, "pass2"
     else:
-        print("→ using BLEND as final submission")
-        final = test_blend; final_oof = blend_w; method = "blend"
+        print(f"\n→ Pseudo did not help ({honest1:.4f} vs {honest2:.4f}); using PASS 1.")
+        final_test, final_oof, used_method, used_pass = test1, oof1, method1, "pass1"
 
     thr = 0.5
-    submission = pd.DataFrame({"PassengerId": test_ids, "Transported": (final >= thr).astype(bool)})
+    submission = pd.DataFrame({"PassengerId": test_ids, "Transported": (final_test >= thr).astype(bool)})
     submission.to_csv(OUT / "submission.csv", index=False)
-    print(f"\nwrote {OUT / 'submission.csv'}  ({len(submission)} rows, method={method}, threshold={thr})")
+    print(f"\nwrote {OUT / 'submission.csv'}  "
+          f"({len(submission)} rows, {used_pass}/{used_method}, threshold={thr})")
 
     oof_df = pd.DataFrame({
         "PassengerId": train_raw["PassengerId"],
-        **{f"oof_{n}": oofs[n] for n in names},
-        "oof_blend": blend_w, "oof_stack": stack_oof_proba,
-        "honest_blend": honest_blend, "honest_stack": honest_stack,
+        **{f"oof1_{n}": oofs[n] for n in names},
+        **{f"oof2_{n}": oofs2[n] for n in names},
+        "honest1": honest1_arr, "honest2": honest2_arr,
+        "oof_final": final_oof,
     })
     oof_df.to_csv(OUT / "oof.csv", index=False)
 
