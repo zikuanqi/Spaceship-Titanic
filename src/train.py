@@ -15,8 +15,11 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from catboost import CatBoostClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 
 from features import CATEGORICAL_COLS, build_features, encode_categoricals
 from target_encoding import TARGET_ENCODE_COLS, apply_target_encoding
@@ -102,6 +105,41 @@ def train_xgb_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int = 42)
     return model.predict_proba(x_va_n)[:, 1], model.predict_proba(x_test_n)[:, 1]
 
 
+def train_hgb_fold(x_tr, y_tr, x_va, y_va, x_test, seed: int = 42):
+    cat_mask = [c in CATEGORICAL_COLS for c in x_tr.columns]
+    x_tr_n = to_categorical_codes(x_tr)
+    x_va_n = to_categorical_codes(x_va)
+    x_test_n = to_categorical_codes(x_test)
+    model = HistGradientBoostingClassifier(
+        max_iter=2000, learning_rate=0.04, max_depth=7,
+        min_samples_leaf=25, l2_regularization=1.0,
+        early_stopping=True, validation_fraction=None,
+        n_iter_no_change=80, scoring="loss",
+        categorical_features=cat_mask, random_state=seed,
+    )
+    model.fit(x_tr_n, y_tr)
+    return model.predict_proba(x_va_n)[:, 1], model.predict_proba(x_test_n)[:, 1]
+
+
+def train_lr_fold(x_tr, y_tr, x_va, y_va, x_test, seed: int = 42):
+    """Logistic regression on dense, scaled features (codes for cats, median impute for nums)."""
+    x_tr_n = to_categorical_codes(x_tr).astype("float64")
+    x_va_n = to_categorical_codes(x_va).astype("float64")
+    x_test_n = to_categorical_codes(x_test).astype("float64")
+    medians = x_tr_n.median(numeric_only=True)
+    x_tr_n = x_tr_n.fillna(medians)
+    x_va_n = x_va_n.fillna(medians)
+    x_test_n = x_test_n.fillna(medians)
+
+    scaler = StandardScaler()
+    x_tr_s = scaler.fit_transform(x_tr_n)
+    x_va_s = scaler.transform(x_va_n)
+    x_test_s = scaler.transform(x_test_n)
+    model = LogisticRegression(C=0.5, max_iter=3000, solver="lbfgs", random_state=seed)
+    model.fit(x_tr_s, y_tr)
+    return model.predict_proba(x_va_s)[:, 1], model.predict_proba(x_test_s)[:, 1]
+
+
 def train_cat_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int = 42):
     cat_idx = [i for i, c in enumerate(x_tr.columns) if c in CATEGORICAL_COLS]
     x_tr_s = x_tr.copy(); x_va_s = x_va.copy(); x_test_s = x_test.copy()
@@ -142,9 +180,13 @@ def main() -> None:
     oof_lgb = np.zeros(len(train_feats))
     oof_xgb = np.zeros(len(train_feats))
     oof_cat = np.zeros(len(train_feats))
+    oof_hgb = np.zeros(len(train_feats))
+    oof_lr  = np.zeros(len(train_feats))
     test_lgb = np.zeros(len(test_feats))
     test_xgb = np.zeros(len(test_feats))
     test_cat = np.zeros(len(test_feats))
+    test_hgb = np.zeros(len(test_feats))
+    test_lr  = np.zeros(len(test_feats))
 
     folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
     for fold, (tr_idx, va_idx) in enumerate(folds.split(train_feats, target), 1):
@@ -172,74 +214,93 @@ def main() -> None:
         oof_cat[va_idx] = cat_va
         test_cat += cat_te / N_SPLITS
 
+        # HistGradientBoosting
+        hgb_va, hgb_te = train_hgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
+        oof_hgb[va_idx] = hgb_va
+        test_hgb += hgb_te / N_SPLITS
+
+        # Logistic Regression
+        lr_va, lr_te = train_lr_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
+        oof_lr[va_idx] = lr_va
+        test_lr += lr_te / N_SPLITS
+
         print(
             f"fold {fold}: "
             f"LGB={accuracy_score(y_va, lgb_va>=0.5):.4f}  "
             f"XGB={accuracy_score(y_va, xgb_va>=0.5):.4f}  "
             f"CAT={accuracy_score(y_va, cat_va>=0.5):.4f}  "
-            f"BLEND={accuracy_score(y_va, ((lgb_va+xgb_va+cat_va)/3)>=0.5):.4f}"
+            f"HGB={accuracy_score(y_va, hgb_va>=0.5):.4f}  "
+            f"LR={accuracy_score(y_va, lr_va>=0.5):.4f}"
         )
 
-    print("\n=== overall CV accuracy ===")
-    print(f"LGB   : {accuracy_score(target, oof_lgb>=0.5):.4f}  (logloss {log_loss(target, oof_lgb):.4f})")
-    print(f"XGB   : {accuracy_score(target, oof_xgb>=0.5):.4f}  (logloss {log_loss(target, oof_xgb):.4f})")
-    print(f"CAT   : {accuracy_score(target, oof_cat>=0.5):.4f}  (logloss {log_loss(target, oof_cat):.4f})")
+    oofs = {"lgb": oof_lgb, "xgb": oof_xgb, "cat": oof_cat, "hgb": oof_hgb, "lr": oof_lr}
+    tests = {"lgb": test_lgb, "xgb": test_xgb, "cat": test_cat, "hgb": test_hgb, "lr": test_lr}
+    names = list(oofs.keys())
 
-    blend_eq = (oof_lgb + oof_xgb + oof_cat) / 3
+    print("\n=== overall CV accuracy ===")
+    for n in names:
+        print(f"{n.upper():5}: {accuracy_score(target, oofs[n]>=0.5):.4f}  (logloss {log_loss(target, oofs[n]):.4f})")
+
+    blend_eq = np.mean(list(oofs.values()), axis=0)
     print(f"BLEND eq    : {accuracy_score(target, blend_eq>=0.5):.4f}  (logloss {log_loss(target, blend_eq):.4f})")
 
-    # ---- search blend weights (simplex grid, step 0.05) -----------------
-    best_w = (1/3, 1/3, 1/3); best_acc = accuracy_score(target, blend_eq >= 0.5)
-    for a in np.arange(0, 1.001, 0.05):
-        for b in np.arange(0, 1.001 - a, 0.05):
-            c = 1.0 - a - b
-            if c < 0:
-                continue
-            mix = a * oof_lgb + b * oof_xgb + c * oof_cat
-            acc = accuracy_score(target, mix >= 0.5)
-            if acc > best_acc:
-                best_acc = acc; best_w = (a, b, c)
-    print(f"BLEND weights: LGB={best_w[0]:.2f} XGB={best_w[1]:.2f} CAT={best_w[2]:.2f}  → CV {best_acc:.4f}")
+    # ---- search blend weights + threshold via differential_evolution ----
+    # Global optimizer; handles the step-function (accuracy) objective well.
+    from scipy.optimize import differential_evolution
 
-    # ---- search threshold on the weighted blend -------------------------
-    blend_w = best_w[0]*oof_lgb + best_w[1]*oof_xgb + best_w[2]*oof_cat
-    best_thr = 0.5
-    for thr in np.arange(0.30, 0.71, 0.01):
-        acc = accuracy_score(target, blend_w >= thr)
-        if acc > best_acc:
-            best_acc = acc; best_thr = thr
-    print(f"BLEND best  : threshold={best_thr:.2f}  → CV {best_acc:.4f}")
+    oof_matrix = np.stack([oofs[n] for n in names], axis=1)
+    test_matrix = np.stack([tests[n] for n in names], axis=1)
+    y = target.to_numpy()
 
-    # ---- rank averaging as an alternative blend -------------------------
-    def to_rank(arr): return pd.Series(arr).rank(pct=True).to_numpy()
-    rank_oof = (to_rank(oof_lgb) + to_rank(oof_xgb) + to_rank(oof_cat)) / 3
-    rank_acc = max(
-        accuracy_score(target, rank_oof >= thr) for thr in np.arange(0.30, 0.71, 0.01)
+    def neg_acc(x):
+        w = np.clip(x[:-1], 0, None); s = w.sum()
+        if s <= 0:
+            return 0.0
+        w = w / s; thr = x[-1]
+        return -accuracy_score(y, oof_matrix @ w >= thr)
+
+    bounds = [(0.0, 1.0)] * len(names) + [(0.35, 0.65)]
+    res = differential_evolution(
+        neg_acc, bounds=bounds, seed=42, maxiter=300, popsize=30,
+        polish=False, tol=1e-7, mutation=(0.5, 1.5), recombination=0.9,
     )
-    rank_thr = max(
-        np.arange(0.30, 0.71, 0.01),
-        key=lambda t: accuracy_score(target, rank_oof >= t),
-    )
-    print(f"BLEND rank  : threshold={rank_thr:.2f}  → CV {rank_acc:.4f}")
+    w_opt = np.clip(res.x[:-1], 0, None); w_opt = w_opt / w_opt.sum()
+    thr_opt = res.x[-1]
+    blend_w = oof_matrix @ w_opt
+    test_blend_w = test_matrix @ w_opt
+    weighted_acc = accuracy_score(y, blend_w >= thr_opt)
+    weighted_ll = log_loss(target, blend_w)
+    print(f"BLEND weights: {dict(zip(names, np.round(w_opt, 3)))}  threshold={thr_opt:.3f}")
+    print(f"BLEND opt   : CV {weighted_acc:.4f}  (logloss {weighted_ll:.4f})")
 
-    if rank_acc > best_acc:
+    # The threshold is already optimized inside differential_evolution.
+    thr_best = thr_opt; thr_acc = weighted_acc
+
+    # ---- rank averaging across all models -------------------------------
+    def to_rank(a): return pd.Series(a).rank(pct=True).to_numpy()
+    rank_oof = np.mean([to_rank(oofs[n]) for n in names], axis=0)
+    rank_thr, rank_acc = 0.5, accuracy_score(target, rank_oof >= 0.5)
+    for thr in np.arange(0.30, 0.71, 0.005):
+        acc = accuracy_score(target, rank_oof >= thr)
+        if acc > rank_acc:
+            rank_acc, rank_thr = acc, thr
+    print(f"BLEND rank  : threshold={rank_thr:.3f}  → CV {rank_acc:.4f}")
+
+    if rank_acc > thr_acc:
         print("→ using rank-averaging blend")
-        final = (to_rank(test_lgb) + to_rank(test_xgb) + to_rank(test_cat)) / 3
-        thr = rank_thr
+        final = np.mean([to_rank(tests[n]) for n in names], axis=0)
+        thr = rank_thr; oof_used = rank_oof
     else:
-        print(f"→ using weighted blend (LGB={best_w[0]:.2f} XGB={best_w[1]:.2f} CAT={best_w[2]:.2f})")
-        final = best_w[0]*test_lgb + best_w[1]*test_xgb + best_w[2]*test_cat
-        thr = best_thr
+        print(f"→ using weighted blend {dict(zip(names, np.round(w_opt, 3)))}")
+        final = test_blend_w
+        thr = thr_best; oof_used = blend_w
 
     submission = pd.DataFrame({"PassengerId": test_ids, "Transported": (final >= thr).astype(bool)})
     submission.to_csv(OUT / "submission.csv", index=False)
     print(f"\nwrote {OUT / 'submission.csv'}  ({len(submission)} rows)")
 
-    pd.DataFrame({
-        "PassengerId": train_raw["PassengerId"],
-        "oof_lgb": oof_lgb, "oof_xgb": oof_xgb, "oof_cat": oof_cat,
-        "oof_blend_weighted": blend_w, "oof_blend_rank": rank_oof,
-    }).to_csv(OUT / "oof.csv", index=False)
+    oof_df = pd.DataFrame({"PassengerId": train_raw["PassengerId"], **{f"oof_{n}": oofs[n] for n in names}, "oof_used": oof_used})
+    oof_df.to_csv(OUT / "oof.csv", index=False)
 
 
 if __name__ == "__main__":
