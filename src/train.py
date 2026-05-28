@@ -241,65 +241,57 @@ def main() -> None:
     for n in names:
         print(f"{n.upper():5}: {accuracy_score(target, oofs[n]>=0.5):.4f}  (logloss {log_loss(target, oofs[n]):.4f})")
 
-    blend_eq = np.mean(list(oofs.values()), axis=0)
-    print(f"BLEND eq    : {accuracy_score(target, blend_eq>=0.5):.4f}  (logloss {log_loss(target, blend_eq):.4f})")
-
-    # ---- search blend weights + threshold via differential_evolution ----
-    # Global optimizer; handles the step-function (accuracy) objective well.
-    from scipy.optimize import differential_evolution
-
     oof_matrix = np.stack([oofs[n] for n in names], axis=1)
     test_matrix = np.stack([tests[n] for n in names], axis=1)
     y = target.to_numpy()
 
-    def neg_acc(x):
-        w = np.clip(x[:-1], 0, None); s = w.sum()
-        if s <= 0:
-            return 0.0
-        w = w / s; thr = x[-1]
-        return -accuracy_score(y, oof_matrix @ w >= thr)
+    blend_eq = oof_matrix.mean(axis=1)
+    print(f"BLEND eq      : acc {accuracy_score(target, blend_eq>=0.5):.4f}  (logloss {log_loss(target, blend_eq):.4f})")
 
-    bounds = [(0.0, 1.0)] * len(names) + [(0.35, 0.65)]
-    res = differential_evolution(
-        neg_acc, bounds=bounds, seed=42, maxiter=300, popsize=30,
-        polish=False, tol=1e-7, mutation=(0.5, 1.5), recombination=0.9,
-    )
-    w_opt = np.clip(res.x[:-1], 0, None); w_opt = w_opt / w_opt.sum()
-    thr_opt = res.x[-1]
+    # ---- logloss-optimal weights on the simplex (smooth, much less prone --
+    # ---- to OOF overfit than tuning weights+threshold against accuracy). -
+    from scipy.optimize import minimize
+
+    def fit_logloss_weights(oof_M: np.ndarray, y_arr: np.ndarray) -> np.ndarray:
+        def neg_ll(w):
+            w = np.clip(w, 1e-9, None); w = w / w.sum()
+            p = np.clip(oof_M @ w, 1e-7, 1 - 1e-7)
+            return -(y_arr * np.log(p) + (1 - y_arr) * np.log(1 - p)).mean()
+        res = minimize(neg_ll, np.ones(oof_M.shape[1]) / oof_M.shape[1],
+                       method="Nelder-Mead",
+                       options={"xatol": 1e-6, "fatol": 1e-7, "maxiter": 8000})
+        w = np.clip(res.x, 0, None); return w / w.sum()
+
+    w_opt = fit_logloss_weights(oof_matrix, y)
     blend_w = oof_matrix @ w_opt
-    test_blend_w = test_matrix @ w_opt
-    weighted_acc = accuracy_score(y, blend_w >= thr_opt)
-    weighted_ll = log_loss(target, blend_w)
-    print(f"BLEND weights: {dict(zip(names, np.round(w_opt, 3)))}  threshold={thr_opt:.3f}")
-    print(f"BLEND opt   : CV {weighted_acc:.4f}  (logloss {weighted_ll:.4f})")
+    test_blend = test_matrix @ w_opt
+    print(f"BLEND weights : {dict(zip(names, np.round(w_opt, 3)))}")
+    print(f"BLEND ll-opt  : acc {accuracy_score(y, blend_w>=0.5):.4f}  (logloss {log_loss(y, blend_w):.4f})")
 
-    # The threshold is already optimized inside differential_evolution.
-    thr_best = thr_opt; thr_acc = weighted_acc
+    # ---- "honest" blend CV: leave-one-fold-out for the weight fit --------
+    # For each outer fold, fit weights on the other 4 folds' OOF only, then
+    # score on the held-out fold. This estimates how the blending procedure
+    # would do on truly unseen rows -- the CV/LB gap should follow this score.
+    honest_preds = np.zeros(len(y))
+    honest_folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+    for tr_idx, va_idx in honest_folds.split(np.zeros(len(y)), y):
+        w_fold = fit_logloss_weights(oof_matrix[tr_idx], y[tr_idx])
+        honest_preds[va_idx] = oof_matrix[va_idx] @ w_fold
+    print(f"BLEND honest  : acc {accuracy_score(y, honest_preds>=0.5):.4f}  (logloss {log_loss(y, honest_preds):.4f})")
+    print("  ^ this is a leak-free estimate of LB.")
 
-    # ---- rank averaging across all models -------------------------------
-    def to_rank(a): return pd.Series(a).rank(pct=True).to_numpy()
-    rank_oof = np.mean([to_rank(oofs[n]) for n in names], axis=0)
-    rank_thr, rank_acc = 0.5, accuracy_score(target, rank_oof >= 0.5)
-    for thr in np.arange(0.30, 0.71, 0.005):
-        acc = accuracy_score(target, rank_oof >= thr)
-        if acc > rank_acc:
-            rank_acc, rank_thr = acc, thr
-    print(f"BLEND rank  : threshold={rank_thr:.3f}  → CV {rank_acc:.4f}")
-
-    if rank_acc > thr_acc:
-        print("→ using rank-averaging blend")
-        final = np.mean([to_rank(tests[n]) for n in names], axis=0)
-        thr = rank_thr; oof_used = rank_oof
-    else:
-        print(f"→ using weighted blend {dict(zip(names, np.round(w_opt, 3)))}")
-        final = test_blend_w
-        thr = thr_best; oof_used = blend_w
-
+    # ---- final submission: logloss weights, threshold 0.5 (no OOF tuning) -
+    final = test_blend
+    thr = 0.5
     submission = pd.DataFrame({"PassengerId": test_ids, "Transported": (final >= thr).astype(bool)})
     submission.to_csv(OUT / "submission.csv", index=False)
-    print(f"\nwrote {OUT / 'submission.csv'}  ({len(submission)} rows)")
+    print(f"\nwrote {OUT / 'submission.csv'}  ({len(submission)} rows, threshold {thr})")
 
-    oof_df = pd.DataFrame({"PassengerId": train_raw["PassengerId"], **{f"oof_{n}": oofs[n] for n in names}, "oof_used": oof_used})
+    oof_df = pd.DataFrame({
+        "PassengerId": train_raw["PassengerId"],
+        **{f"oof_{n}": oofs[n] for n in names},
+        "oof_blend": blend_w, "oof_honest": honest_preds,
+    })
     oof_df.to_csv(OUT / "oof.csv", index=False)
 
 
