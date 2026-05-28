@@ -268,29 +268,58 @@ def main() -> None:
     print(f"BLEND weights : {dict(zip(names, np.round(w_opt, 3)))}")
     print(f"BLEND ll-opt  : acc {accuracy_score(y, blend_w>=0.5):.4f}  (logloss {log_loss(y, blend_w):.4f})")
 
-    # ---- "honest" blend CV: leave-one-fold-out for the weight fit --------
-    # For each outer fold, fit weights on the other 4 folds' OOF only, then
-    # score on the held-out fold. This estimates how the blending procedure
-    # would do on truly unseen rows -- the CV/LB gap should follow this score.
-    honest_preds = np.zeros(len(y))
+    # ---- Stacking: L2 logistic regression on OOF predictions -------------
+    # Inputs are logit(p) per base model -- gives the meta-learner linear
+    # access to log-odds, often better than raw probabilities.
+    def to_logit(p):
+        p = np.clip(p, 1e-6, 1 - 1e-6); return np.log(p / (1 - p))
+    Z = to_logit(oof_matrix); Z_test = to_logit(test_matrix)
+
+    meta = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs", random_state=42)
+    meta.fit(Z, y)
+    stack_oof_proba = meta.predict_proba(Z)[:, 1]
+    stack_test_proba = meta.predict_proba(Z_test)[:, 1]
+    print(f"STACK in-fit  : acc {accuracy_score(y, stack_oof_proba>=0.5):.4f}  "
+          f"(logloss {log_loss(y, stack_oof_proba):.4f})")
+    print(f"  meta coefs  : {dict(zip(names, np.round(meta.coef_[0], 3)))}  intercept={meta.intercept_[0]:.3f}")
+
+    # ---- "honest" CV: leave-one-fold-out for BOTH the weight fit and -----
+    # the stacking fit. Unbiased estimate of LB performance.
+    honest_blend = np.zeros(len(y))
+    honest_stack = np.zeros(len(y))
     honest_folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
     for tr_idx, va_idx in honest_folds.split(np.zeros(len(y)), y):
         w_fold = fit_logloss_weights(oof_matrix[tr_idx], y[tr_idx])
-        honest_preds[va_idx] = oof_matrix[va_idx] @ w_fold
-    print(f"BLEND honest  : acc {accuracy_score(y, honest_preds>=0.5):.4f}  (logloss {log_loss(y, honest_preds):.4f})")
-    print("  ^ this is a leak-free estimate of LB.")
+        honest_blend[va_idx] = oof_matrix[va_idx] @ w_fold
 
-    # ---- final submission: logloss weights, threshold 0.5 (no OOF tuning) -
-    final = test_blend
+        meta_f = LogisticRegression(C=1.0, max_iter=2000, solver="lbfgs", random_state=42)
+        meta_f.fit(Z[tr_idx], y[tr_idx])
+        honest_stack[va_idx] = meta_f.predict_proba(Z[va_idx])[:, 1]
+
+    blend_honest_acc = accuracy_score(y, honest_blend >= 0.5)
+    stack_honest_acc = accuracy_score(y, honest_stack >= 0.5)
+    print(f"BLEND honest  : acc {blend_honest_acc:.4f}  (logloss {log_loss(y, honest_blend):.4f})")
+    print(f"STACK honest  : acc {stack_honest_acc:.4f}  (logloss {log_loss(y, honest_stack):.4f})")
+    print("  ^ leak-free estimates of LB.")
+
+    # ---- pick whichever has the better honest CV -------------------------
+    if stack_honest_acc > blend_honest_acc:
+        print("→ using STACK as final submission")
+        final = stack_test_proba; final_oof = stack_oof_proba; method = "stack"
+    else:
+        print("→ using BLEND as final submission")
+        final = test_blend; final_oof = blend_w; method = "blend"
+
     thr = 0.5
     submission = pd.DataFrame({"PassengerId": test_ids, "Transported": (final >= thr).astype(bool)})
     submission.to_csv(OUT / "submission.csv", index=False)
-    print(f"\nwrote {OUT / 'submission.csv'}  ({len(submission)} rows, threshold {thr})")
+    print(f"\nwrote {OUT / 'submission.csv'}  ({len(submission)} rows, method={method}, threshold={thr})")
 
     oof_df = pd.DataFrame({
         "PassengerId": train_raw["PassengerId"],
         **{f"oof_{n}": oofs[n] for n in names},
-        "oof_blend": blend_w, "oof_honest": honest_preds,
+        "oof_blend": blend_w, "oof_stack": stack_oof_proba,
+        "honest_blend": honest_blend, "honest_stack": honest_stack,
     })
     oof_df.to_csv(OUT / "oof.csv", index=False)
 
