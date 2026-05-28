@@ -321,33 +321,47 @@ def main() -> None:
             return test_blend if False else stack_test, stack_oof, sh, honest_stack, "stack"
         return test_blend, blend_w, bh, honest_blend, "blend"
 
-    test1, oof1, honest1, honest1_arr, method1 = report(oofs, tests, "PASS 1 (no pseudo)")
+    test_cur, oof_cur, honest_cur, honest_cur_arr, method_cur = report(oofs, tests, "PASS 1 (no pseudo)")
 
-    # ============== Pseudo-labeling round ==============
-    mask_pseudo = (test1 >= PSEUDO_HIGH) | (test1 <= PSEUDO_LOW)
-    n_pseudo = int(mask_pseudo.sum())
-    print(f"\n=== Pseudo-labeling ===")
-    print(f"  threshold [<{PSEUDO_LOW}, >{PSEUDO_HIGH}] → {n_pseudo}/{len(test_feats)} "
-          f"test rows selected ({100*n_pseudo/len(test_feats):.1f}%)")
+    # ============== Iterative pseudo-labeling ==============
+    MAX_PSEUDO_ROUNDS = 3
+    best_test, best_oof, best_honest, best_method, best_pass = test_cur, oof_cur, honest_cur, method_cur, "pass1"
+    last_oofs, last_tests = oofs, tests
 
-    pseudo_X = test_feats.iloc[mask_pseudo].reset_index(drop=True)
-    pseudo_y = pd.Series((test1[mask_pseudo] >= 0.5).astype(int)).reset_index(drop=True)
-    print(f"  pseudo label balance: {pseudo_y.mean():.3f} positive")
+    for r in range(1, MAX_PSEUDO_ROUNDS + 1):
+        mask_pseudo = (test_cur >= PSEUDO_HIGH) | (test_cur <= PSEUDO_LOW)
+        n_pseudo = int(mask_pseudo.sum())
+        print(f"\n=== Pseudo round {r} ===")
+        print(f"  threshold [<{PSEUDO_LOW}, >{PSEUDO_HIGH}] → {n_pseudo}/{len(test_feats)} "
+              f"test rows selected ({100*n_pseudo/len(test_feats):.1f}%)")
 
-    oofs2, tests2, _ = run_ensemble(
-        train_feats, target, test_feats,
-        lgb_params, xgb_params, cat_params,
-        extra_X=pseudo_X, extra_y=pseudo_y, label="pass 2",
-    )
-    test2, oof2, honest2, honest2_arr, method2 = report(oofs2, tests2, "PASS 2 (with pseudo)")
+        pseudo_X = test_feats.iloc[mask_pseudo].reset_index(drop=True)
+        pseudo_y = pd.Series((test_cur[mask_pseudo] >= 0.5).astype(int)).reset_index(drop=True)
+        print(f"  pseudo label balance: {pseudo_y.mean():.3f} positive")
 
-    # ============== Pick the better pass ==============
-    if honest2 > honest1:
-        print(f"\n→ Pseudo helped ({honest1:.4f} → {honest2:.4f}); using PASS 2.")
-        final_test, final_oof, used_method, used_pass = test2, oof2, method2, "pass2"
-    else:
-        print(f"\n→ Pseudo did not help ({honest1:.4f} vs {honest2:.4f}); using PASS 1.")
-        final_test, final_oof, used_method, used_pass = test1, oof1, method1, "pass1"
+        oofs_r, tests_r, _ = run_ensemble(
+            train_feats, target, test_feats,
+            lgb_params, xgb_params, cat_params,
+            extra_X=pseudo_X, extra_y=pseudo_y, label=f"pass {r+1}",
+        )
+        test_r, oof_r, honest_r, honest_r_arr, method_r = report(
+            oofs_r, tests_r, f"PASS {r+1} (pseudo round {r})"
+        )
+
+        if honest_r > best_honest + 1e-5:
+            print(f"\n→ Round {r} improved honest CV: {best_honest:.4f} → {honest_r:.4f}")
+            best_test, best_oof, best_honest = test_r, oof_r, honest_r
+            best_method, best_pass = method_r, f"pass{r+1}"
+            test_cur, oof_cur = test_r, oof_r
+            last_oofs, last_tests = oofs_r, tests_r
+        else:
+            print(f"\n→ Round {r} did not improve ({best_honest:.4f} ≥ {honest_r:.4f}); stopping iteration.")
+            break
+
+    final_test, final_oof = best_test, best_oof
+    used_method, used_pass = best_method, best_pass
+    oofs2, tests2 = last_oofs, last_tests
+    print(f"\n=== Final: {used_pass}/{used_method}  honest CV {best_honest:.4f} ===")
 
     thr = 0.5
     submission = pd.DataFrame({"PassengerId": test_ids, "Transported": (final_test >= thr).astype(bool)})
@@ -357,9 +371,8 @@ def main() -> None:
 
     oof_df = pd.DataFrame({
         "PassengerId": train_raw["PassengerId"],
-        **{f"oof1_{n}": oofs[n] for n in names},
-        **{f"oof2_{n}": oofs2[n] for n in names},
-        "honest1": honest1_arr, "honest2": honest2_arr,
+        **{f"oof_pass1_{n}": oofs[n] for n in names},
+        **{f"oof_last_{n}": oofs2[n] for n in names},
         "oof_final": final_oof,
     })
     oof_df.to_csv(OUT / "oof.csv", index=False)
