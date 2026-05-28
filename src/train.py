@@ -34,7 +34,7 @@ OUT.mkdir(exist_ok=True)
 PARAMS.mkdir(exist_ok=True)
 
 N_SPLITS = 5
-LGB_SEEDS = [42, 1337, 2024]
+LGB_SEEDS = [42, 1337, 2024, 7, 99, 314]
 
 # Pseudo-labeling: pick test rows where the first-pass blend is very confident.
 PSEUDO_HIGH = 0.92
@@ -184,7 +184,6 @@ def run_ensemble(
     oof_xgb = np.zeros(n_train); test_xgb = np.zeros(n_test)
     oof_cat = np.zeros(n_train); test_cat = np.zeros(n_test)
     oof_hgb = np.zeros(n_train); test_hgb = np.zeros(n_test)
-    oof_lr  = np.zeros(n_train); test_lr  = np.zeros(n_test)
 
     folds = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
     for fold, (tr_idx, va_idx) in enumerate(folds.split(train_feats, target), 1):
@@ -214,20 +213,16 @@ def run_ensemble(
         hgb_va, hgb_te = train_hgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
         oof_hgb[va_idx] = hgb_va; test_hgb += hgb_te / N_SPLITS
 
-        lr_va, lr_te = train_lr_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
-        oof_lr[va_idx] = lr_va; test_lr += lr_te / N_SPLITS
-
         print(
             f"[{label}] fold {fold}: "
             f"LGB={accuracy_score(y_va, lgb_va>=0.5):.4f}  "
             f"XGB={accuracy_score(y_va, xgb_va>=0.5):.4f}  "
             f"CAT={accuracy_score(y_va, cat_va>=0.5):.4f}  "
-            f"HGB={accuracy_score(y_va, hgb_va>=0.5):.4f}  "
-            f"LR={accuracy_score(y_va, lr_va>=0.5):.4f}"
+            f"HGB={accuracy_score(y_va, hgb_va>=0.5):.4f}"
         )
 
-    oofs = {"lgb": oof_lgb, "xgb": oof_xgb, "cat": oof_cat, "hgb": oof_hgb, "lr": oof_lr}
-    tests = {"lgb": test_lgb, "xgb": test_xgb, "cat": test_cat, "hgb": test_hgb, "lr": test_lr}
+    oofs = {"lgb": oof_lgb, "xgb": oof_xgb, "cat": oof_cat, "hgb": oof_hgb}
+    tests = {"lgb": test_lgb, "xgb": test_xgb, "cat": test_cat, "hgb": test_hgb}
     return oofs, tests, list(oofs.keys())
 
 
