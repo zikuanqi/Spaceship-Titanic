@@ -57,6 +57,16 @@ def load_xgb_params() -> dict:
     return json.loads(path.read_text())
 
 
+def load_cat_params() -> dict:
+    path = PARAMS / "cat_params.json"
+    if not path.exists():
+        return {
+            "learning_rate": 0.03, "depth": 6, "l2_leaf_reg": 3.0,
+            "bagging_temperature": 0.5, "random_strength": 1.0, "border_count": 128,
+        }
+    return json.loads(path.read_text())
+
+
 def to_categorical_codes(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in CATEGORICAL_COLS:
@@ -92,7 +102,7 @@ def train_xgb_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int = 42)
     return model.predict_proba(x_va_n)[:, 1], model.predict_proba(x_test_n)[:, 1]
 
 
-def train_cat_fold(x_tr, y_tr, x_va, y_va, x_test, seed: int = 42):
+def train_cat_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int = 42):
     cat_idx = [i for i, c in enumerate(x_tr.columns) if c in CATEGORICAL_COLS]
     x_tr_s = x_tr.copy(); x_va_s = x_va.copy(); x_test_s = x_test.copy()
     for col in CATEGORICAL_COLS:
@@ -101,8 +111,8 @@ def train_cat_fold(x_tr, y_tr, x_va, y_va, x_test, seed: int = 42):
             x_va_s[col] = x_va_s[col].astype(str).fillna("nan")
             x_test_s[col] = x_test_s[col].astype(str).fillna("nan")
     model = CatBoostClassifier(
-        iterations=4000, learning_rate=0.03, depth=6, l2_leaf_reg=3.0,
-        bagging_temperature=0.5, random_strength=1.0,
+        **params,
+        iterations=4000,
         early_stopping_rounds=120, eval_metric="Accuracy",
         random_seed=seed, verbose=0, cat_features=cat_idx,
     )
@@ -124,8 +134,10 @@ def main() -> None:
 
     lgb_params = load_lgb_params()
     xgb_params = load_xgb_params()
+    cat_params = load_cat_params()
     print(f"LGB params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in lgb_params.items() if k not in ('objective','metric','verbose')}, indent=None)}")
     print(f"XGB params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in xgb_params.items()}, indent=None)}")
+    print(f"CAT params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in cat_params.items()}, indent=None)}")
 
     oof_lgb = np.zeros(len(train_feats))
     oof_xgb = np.zeros(len(train_feats))
@@ -156,7 +168,7 @@ def main() -> None:
         test_xgb += xgb_te / N_SPLITS
 
         # CatBoost
-        cat_va, cat_te = train_cat_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
+        cat_va, cat_te = train_cat_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, cat_params)
         oof_cat[va_idx] = cat_va
         test_cat += cat_te / N_SPLITS
 

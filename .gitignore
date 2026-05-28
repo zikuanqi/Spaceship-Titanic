@@ -1,6 +1,7 @@
 # Data and outputs — not source files
 data/
 output/
+catboost_info/
 
 # Python
 __pycache__/
