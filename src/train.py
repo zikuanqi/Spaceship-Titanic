@@ -26,20 +26,33 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 OUT = ROOT / "output"
+PARAMS = ROOT / "params"
 OUT.mkdir(exist_ok=True)
+PARAMS.mkdir(exist_ok=True)
 
 N_SPLITS = 5
 LGB_SEEDS = [42, 1337, 2024]
 
 
 def load_lgb_params() -> dict:
-    path = OUT / "lgb_params.json"
+    path = PARAMS / "lgb_params.json"
     if not path.exists():
         return {
             "objective": "binary", "metric": "binary_error", "verbose": -1,
             "learning_rate": 0.05, "num_leaves": 63, "min_data_in_leaf": 30,
             "feature_fraction": 0.85, "bagging_fraction": 0.85, "bagging_freq": 5,
             "lambda_l1": 0.1, "lambda_l2": 1.0,
+        }
+    return json.loads(path.read_text())
+
+
+def load_xgb_params() -> dict:
+    path = PARAMS / "xgb_params.json"
+    if not path.exists():
+        return {
+            "learning_rate": 0.03, "max_depth": 6, "min_child_weight": 5,
+            "subsample": 0.85, "colsample_bytree": 0.85,
+            "reg_lambda": 1.0, "reg_alpha": 0.1, "gamma": 0.0,
         }
     return json.loads(path.read_text())
 
@@ -66,15 +79,13 @@ def train_lgb_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int):
     )
 
 
-def train_xgb_fold(x_tr, y_tr, x_va, y_va, x_test, seed: int = 42):
+def train_xgb_fold(x_tr, y_tr, x_va, y_va, x_test, params: dict, seed: int = 42):
     x_tr_n = to_categorical_codes(x_tr)
     x_va_n = to_categorical_codes(x_va)
     x_test_n = to_categorical_codes(x_test)
     model = xgb.XGBClassifier(
-        n_estimators=4000, learning_rate=0.03, max_depth=6,
-        min_child_weight=5, subsample=0.85, colsample_bytree=0.85,
-        reg_lambda=1.0, reg_alpha=0.1, tree_method="hist",
-        early_stopping_rounds=120, eval_metric="logloss",
+        n_estimators=4000, **params,
+        tree_method="hist", early_stopping_rounds=120, eval_metric="logloss",
         random_state=seed, verbosity=0,
     )
     model.fit(x_tr_n, y_tr, eval_set=[(x_va_n, y_va)], verbose=False)
@@ -112,7 +123,9 @@ def main() -> None:
     print(f"features: {train_feats.shape[1]} cols + {len(TARGET_ENCODE_COLS)} TE features per fold")
 
     lgb_params = load_lgb_params()
+    xgb_params = load_xgb_params()
     print(f"LGB params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in lgb_params.items() if k not in ('objective','metric','verbose')}, indent=None)}")
+    print(f"XGB params: {json.dumps({k: round(v,4) if isinstance(v,float) else v for k,v in xgb_params.items()}, indent=None)}")
 
     oof_lgb = np.zeros(len(train_feats))
     oof_xgb = np.zeros(len(train_feats))
@@ -138,7 +151,7 @@ def main() -> None:
         test_lgb += lgb_te / N_SPLITS
 
         # XGBoost
-        xgb_va, xgb_te = train_xgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te)
+        xgb_va, xgb_te = train_xgb_fold(x_tr_te, y_tr, x_va_te, y_va, x_test_te, xgb_params)
         oof_xgb[va_idx] = xgb_va
         test_xgb += xgb_te / N_SPLITS
 
