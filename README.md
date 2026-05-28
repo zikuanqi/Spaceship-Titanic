@@ -4,55 +4,78 @@ Solution for the Kaggle [Spaceship Titanic](https://www.kaggle.com/competitions/
 
 ## Result
 
-| Metric | Score |
+| Stage | CV accuracy |
 |---|---|
-| 5-fold CV accuracy | **0.8125** |
+| LightGBM baseline | 0.8125 |
+| + new features, Optuna-tuned LGB | 0.8171 |
+| + XGBoost + CatBoost weighted blend | **0.8185** |
 
-LightGBM with feature engineering on the standard tabular features. Public-leaderboard top scores typically sit in the 0.81–0.82 range, so this is a solid baseline without ensembling or hyperparameter search.
+Top public-leaderboard scores typically sit at 0.81–0.82.
 
 ## Approach
 
-1. **Feature engineering** (`src/features.py`)
-   - `PassengerId` → `Group`, `GroupPos`, `GroupSize`, `IsAlone`
-   - `Cabin` → `Deck`, `CabinNum`, `Side`
-   - `Name` → `FamilySize` (by last name)
-   - 5 spending columns → `TotalSpend`, `NoSpend`, plus per-column `log1p` transforms
-   - Cross-imputation: if `CryoSleep=True`, spending must be 0; if any spending recorded, `CryoSleep=False`
-   - `IsChild` flag (age < 13)
-2. **Model**: LightGBM, 5-fold stratified CV, early stopping on validation `binary_error`
-3. **Prediction**: average of 5 fold predictions, threshold 0.5
+### Feature engineering (`src/features.py`, 45 columns)
+- `PassengerId` → `Group`, `GroupPos`, `GroupSize`, `IsAlone`, `LargeGroup`
+- `Cabin` → `Deck`, `CabinNum`, `Side`, `CabinRegion` (bucketed)
+- `Name` → `FamilySize` (by last name)
+- Spending: `TotalSpend`, `LogTotalSpend`, `NoSpend`, per-column `log1p`, `LuxurySpend`, `EssentialSpend`, `LuxuryRatio`, `NumSpendCats`, `TopSpendCat`
+- Group-level: `GroupTotalSpend`, `GroupMeanSpend`, `GroupCryoRatio`
+- Cross-imputation: `CryoSleep=True` ⇒ spending = 0; any spending recorded ⇒ `CryoSleep=False`; `CryoSleep` missing with zero spending ⇒ `True`
+- Interactions: `DeckPlanet` (Deck × HomePlanet)
+- Age: `IsChild`, `IsTeen`, `AgeBin`, `AgeMissing`
+
+### Leak-free target encoding (`src/target_encoding.py`)
+Smoothed target encoding for `Deck`, `HomePlanet`, `Destination`, `DeckPlanet`, `CabinRegion`, `TopSpendCat` — computed **inside each CV fold** using only the training portion (smoothing = 20).
+
+### Hyperparameter tuning (`src/tune.py`)
+Optuna TPE sampler, 25 trials, 3-fold stratified internal CV. Saves best params to `output/lgb_params.json`.
+
+### Ensemble (`src/train.py`)
+For each of 5 outer folds:
+1. **LightGBM** with tuned params, averaged over 3 seeds (42, 1337, 2024)
+2. **XGBoost** (`hist`, depth 6, lr 0.03)
+3. **CatBoost** (depth 6, lr 0.03, native categorical support)
+
+Then on OOF predictions:
+- **Weight search**: simplex grid over (LGB, XGB, CAT) ∈ ½ steps of 0.05 → winners `0.50 / 0.30 / 0.20`
+- **Threshold search**: 0.30 → 0.70 step 0.01 → optimal 0.50
+- **Rank-average comparison**: kept whichever scores higher OOF
 
 ## Reproduce
 
 ```bash
 pip install -r requirements.txt
-# Download competition data (uses your Kaggle credentials)
+
+# 1. Download data
 python -c "import kagglehub; print(kagglehub.competition_download('spaceship-titanic'))"
 # Copy train.csv / test.csv / sample_submission.csv into data/
+
+# 2. Tune LightGBM (saves output/lgb_params.json)
+python src/tune.py
+
+# 3. Train ensemble (writes output/submission.csv)
 python src/train.py
 ```
-
-Output:
-- `output/submission.csv` — Kaggle-format predictions
-- `output/oof.csv` — out-of-fold probabilities for analysis
 
 ## Submit to Kaggle
 
 ```bash
 kaggle competitions submit -c spaceship-titanic \
     -f output/submission.csv \
-    -m "LGB 5-fold, CV 0.8125"
+    -m "LGB+XGB+CAT weighted blend, CV 0.8185"
 ```
 
 ## Project layout
 
 ```
 .
-├── data/                  # train.csv, test.csv, sample_submission.csv (gitignored)
-├── output/                # submission.csv, oof.csv (gitignored)
+├── data/                  # gitignored
+├── output/                # submission.csv, oof.csv, lgb_params.json (gitignored)
 ├── src/
 │   ├── features.py        # feature engineering
-│   └── train.py           # training + CV + submission
+│   ├── target_encoding.py # leak-free smoothed target encoding
+│   ├── tune.py            # Optuna search for LGB
+│   └── train.py           # ensemble training + blend optimization
 ├── requirements.txt
 └── README.md
 ```
